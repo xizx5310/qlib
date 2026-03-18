@@ -2,10 +2,11 @@
 Sync GitHub repo files to Notion pages.
 Skip: .csv, .pkl, and other binary/data files.
 Each file becomes a sub-page under the target Notion page.
+Optimized: packs multiple rich_text objects into a single code block
+to minimize block count and API calls.
 """
 
 import os
-import hashlib
 from pathlib import Path
 from notion_client import Client
 
@@ -27,7 +28,8 @@ SKIP_DIRS = {
     "egg-info",
 }
 
-MAX_BLOCK_TEXT = 2000  # Notion API limit per rich_text block
+MAX_RICH_TEXT_LEN = 2000          # Notion API: single rich_text limit
+MAX_RICH_TEXTS_PER_BLOCK = 90     # safe margin (API max ~100)
 
 notion = Client(auth=NOTION_TOKEN)
 
@@ -55,8 +57,8 @@ def get_language(suffix: str) -> str:
     return mapping.get(suffix, "plain text")
 
 
-def chunk_text(text: str, size: int = MAX_BLOCK_TEXT):
-    """Split text into chunks respecting line boundaries."""
+def chunk_text(text: str, size: int = MAX_RICH_TEXT_LEN):
+    """Split text into chunks of ≤ size chars, respecting line boundaries."""
     lines = text.split("\n")
     chunks, current = [], []
     current_len = 0
@@ -69,6 +71,31 @@ def chunk_text(text: str, size: int = MAX_BLOCK_TEXT):
     if current:
         chunks.append("\n".join(current))
     return chunks
+
+
+def build_code_blocks(content: str, lang: str):
+    """Build code blocks, packing multiple rich_text per block.
+
+    Each code block can hold up to MAX_RICH_TEXTS_PER_BLOCK rich_text
+    objects (each ≤ 2000 chars), so one block can store ~180k chars.
+    Most files fit in a single block.
+    """
+    chunks = chunk_text(content, MAX_RICH_TEXT_LEN)
+    children = []
+    for i in range(0, len(chunks), MAX_RICH_TEXTS_PER_BLOCK):
+        batch = chunks[i : i + MAX_RICH_TEXTS_PER_BLOCK]
+        rich_texts = [
+            {"type": "text", "text": {"content": c}} for c in batch
+        ]
+        children.append({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": rich_texts,
+                "language": lang,
+            },
+        })
+    return children
 
 
 # ── Notion Operations ───────────────────────────────────
@@ -109,22 +136,11 @@ def clear_page(page_id: str):
 def create_or_update_page(parent_id: str, title: str, content: str,
                           lang: str, existing: dict):
     """Create or update a Notion page with file content."""
-    children = []
-    chunks = chunk_text(content)
-    for chunk in chunks:
-        children.append({
-            "object": "block",
-            "type": "code",
-            "code": {
-                "rich_text": [{"type": "text", "text": {"content": chunk}}],
-                "language": lang,
-            },
-        })
+    children = build_code_blocks(content, lang)
 
     if title in existing:
         page_id = existing[title]
         clear_page(page_id)
-        # Append in batches of 100
         for i in range(0, len(children), 100):
             notion.blocks.children.append(
                 block_id=page_id, children=children[i : i + 100]
